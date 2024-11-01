@@ -1,0 +1,754 @@
+---
+title: "Machine Learning Project_Wine Quality"
+output:
+  pdf_document: default
+  html_document: default
+date: "2024-03-04"
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(Cubist)
+library(rules)
+library(keras)
+library(gam)
+library(glmnet)
+library(ranger)
+library(tensorflow)
+library(e1071)
+library(kernlab)
+library("gridExtra")
+library(tidymodels)
+library(tidyverse)
+tidymodels_prefer(quiet = TRUE)
+set.seed(24155)
+```
+
+# Wine Quality Prediction
+
+In this project, I aim to answer the question of what is the best model to predict the quality of white wine based on its physicochemical properties, and to what extent can we predict red wine quality with models trained on white wine data.\
+
+## Dataset Description
+This dataset contains physicochemical and sensory data for red wine and white wine.
+It contains 11 input variables capturing wine properties like acidity, sugar, alcohol levels, etc.
+The output variable is a wine quality score between 3 and 9 as rated.
+The red wine dataset has 1,599 instances, while the white wine dataset is larger with 4,898 instances.\
+
+```{r}
+wine.red <- read.csv("winequality-red.csv", header = T, sep = ';')
+wine.white <- read.csv("winequality-white.csv", header = T, sep = ';')
+predictors <- setdiff(names(wine.white), "quality")
+names(wine.white)
+dim(wine.red)
+dim(wine.white)
+```
+ 
+## Introduction
+ 
+I used the dataset of white wine to fit various regression models, high-dimensional models, gradient descent, and other techniques for training purposes.
+Additionally, I utilised the dataset of red wine for OOD generalization to compare the RMSE and MAE of the trained models on this unseen OOD dataset with the corresponding metrics from the training and testing sets.\
+ 
+## Exploratory Data Analysis
+I generated plots for each variable to explore the relationships in relation to the wine quality.
+I chose three different types as examples to analyze:\
+1. Fixed acidity: There seems to be no clear trend between fixed acidity and wine quality, as the fitted line is fairly horizontal.
+2. Free Sulfur Dioxide: The line shows a downward trend, implying that lower levels of free sulfur dioxide might correlate with higher wine quality.
+3. Alcohol: There's a noticeable upward trend, suggesting a positive correlation between alcohol content and wine quality, where higher alcohol may correspond to higher quality.\
+
+```{r}
+# Generating plots with a loop
+plot_list <- list()
+for(predictor in predictors) {
+  p <- ggplot(wine.white, aes(x = !!sym(predictor), y = quality)) +
+    geom_point() +
+    geom_smooth(method = "loess", se = FALSE)
+    ggtitle(paste("Q vs", predictor)) +
+    theme(legend.position = "none")
+  plot_list[[predictor]] <- p
+}
+do.call(grid.arrange, c(plot_list, ncol = 3))
+
+```
+
+#### Preparing Dataset
+
+Firstly, I splited the white wine dataset into training (70%) and testing (30%) sets for model training.Then I created a recipe to normalize numeric predictors and preprocessed the data.
+Furthermore, I set up 5-fold cross-validation for hyperparameter tuning.
+Lastly, I defined custom functions and initialised a tibble to store combined results.
+
+```{r}
+# Splitting the datset into 70% and 30%
+split.white <- initial_split(wine.white, prop = 0.7)
+train.white <- training(split.white)
+test.white <- testing(split.white)
+
+# Create the recipe and preprocess the data
+recipe.white <- recipe(quality ~ ., data = train.white) |>
+  step_normalize(all_numeric_predictors())
+
+prep.white <- prep(recipe.white) 
+bake.white.train <- juice(prep.white) 
+bake.white.test <- bake(prep.white, test.white)
+bake.red <- bake(prep.white, wine.red)
+
+# Define a cross-validation and global variables
+resamples <- vfold_cv(train.white, v = 5)
+iter = 5
+reci <- recipe.white
+data_train <- train.white
+data_test <- test.white
+
+# Create a workflow 
+wf_custom <- function(model) {
+  workflow() |> 
+    add_recipe(reci) |> 
+    add_model(model)
+}
+
+# Perform hyperparameter tuning 
+grid_custom <- function(wf, grid = 100) {
+  wf |> 
+    tune_grid(
+      resamples = resamples,
+      grid = grid,
+      metrics = metric_set(rmse),
+      control = control_grid(parallel_over = "everything", verbose = FALSE)
+    )
+}
+
+# Fit a model with the best hyperparameters
+fit_custom <- function(wf, tuned_results) {
+  wf |> 
+    finalize_workflow(select_best(tuned_results, metric = "rmse")) |> 
+    fit(data = data_train)
+}
+
+# Evaluate a fitted model on both training and testing data
+eval_test_custom <- function(fitted_model, model_name) {
+  test_preds <- predict(fitted_model, new_data = data_test) |>
+    bind_cols(actual = data_test$quality)
+  train_preds <- predict(fitted_model, new_data = data_train) |>
+    bind_cols(actual = data_train$quality)
+  rmse_tra <- rmse(train_preds, truth = actual, estimate = .pred) |> pull(.estimate)
+  mae_tra <- mae(train_preds, truth = actual, estimate = .pred) |> pull(.estimate)
+  rmse_val <- rmse(test_preds, truth = actual, estimate = .pred) |> pull(.estimate)
+  mae_val <- mae(test_preds, truth = actual, estimate = .pred) |> pull(.estimate)
+  tibble(
+    model = model_name,
+    test_rmse = rmse_val,
+    test_mae = mae_val,
+    train_rmse = rmse_tra,
+    train_mae = mae_tra
+  )
+}
+# Initilise results tibble
+results_combined <- tibble(model = character(), test_rmse = numeric(),
+                           test_mae = numeric(), train_rmse = numeric(), train_mae = numeric())
+```
+
+```{r}
+# Load tuned results as tuning is very time-consuming during knitting
+load("high_dim_data.RData")
+load("data.RData")
+```
+
+## Model Fitting and Evaluation
+
+### Baseline Linear Regression Model
+
+The baseline model is a simple linear regression model that is used as a benchmark for comparison with more sophisticated models.
+In this case, I only considered three plausible predictors through looking at plots (`alcohol`, `PH` and `residual sugar`) and assumes a linear relationship between these predictors and the target variable.
+
+```{r}
+baseline_lm <- linear_reg() |> set_engine("lm") |> set_mode("regression")
+lm_baseline_fitted <- baseline_lm |> fit(formula = quality~alcohol+pH+residual.sugar, data = train.white)
+lm_baseline_results <- eval_test_custom(lm_baseline_fitted, "lm_baseline")
+results_combined <- bind_rows(results_combined, lm_baseline_results)
+lm_baseline_results
+```
+
+### Baseline Multiple Linear Regression Model
+
+I fitted a standard linear regression model as a baseline, considering all possible predictors to capture potential relationships with wine quality.
+This standard model assumes a linear relationship between the properties and the target variable.
+Also, it showed improved predictive accuracy over the previous one.\
+
+```{r}
+lm_model <- linear_reg() |> set_engine("lm") |> set_mode("regression")
+wf_lm <- wf_custom(lm_model)
+lm_fitted <- wf_lm |> fit(data = train.white)
+lm_results <- eval_test_custom(lm_fitted, "lm")
+results_combined <- bind_rows(results_combined, lm_results)
+lm_results
+```
+
+## None-baseline Models
+
+### Random Forest Model
+I adopted the random forest algorithm as a non-baseline model with high predictive accuracy, which is an ensemble of decision trees. Random forest is best performing model among all on test data, with RMSE of 0.60 on test dataset.
+The plots indicate the relationship between different hyperparameter values and RMSE.
+The left plot suggests an optimal `mtry` value around 3-4 predictors per split.
+The middle plot shows diminishing returns beyond 500-1000 trees.
+The right plot indicates an optimal `min_n` value of around 2 observations per leaf node.\
+
+```{r}
+rf_spec <-
+  rand_forest(
+    mtry = tune(),
+    trees = tune(),
+    min_n = tune()
+  ) |> 
+  set_engine("ranger") |>
+  set_mode("regression")
+rf_wf <- wf_custom(rf_spec)
+rf_set <- rf_wf |> extract_parameter_set_dials() |>
+  update(mtry = finalize(mtry(), data_train))
+# rf_tuned <- rf_wf |> tune_bayes(
+#   resamples = resamples,
+#   initial = 10,
+#   iter = 10,
+#   metrics = metric_set(rmse),
+#   param_info = rf_set,
+#   control = control_bayes(no_improve = 5, verbose = F)
+# )
+autoplot(rf_tuned)
+show_best(rf_tuned, metric = "rmse", n = 5)
+rf_fitted <- fit_custom(rf_wf, rf_tuned)
+(rf_results <- eval_test_custom(rf_fitted, "rf"))
+results_combined <- bind_rows(results_combined, rf_results)
+
+```
+\
+
+### Boosted Tree Model
+The boosted tree model is considered as a model that more focuses on the predictive accuracy without interpretability. The model achieve a close to zero bias on training data by its design.
+The hyperparameters such as the number of `trees`, `tree depth`, `mtry` and `min_n` are tuned in this model.The first plot indicates that the model performs better with a larger number of trees, as the RMSE tends to decrease as the number of trees increases.
+The second plot suggests that deeper trees (higher tree depth) generally lead to lower RMSE values.The third plot shows the impact of the minimal node size on the model's performance.
+It appears that smaller node sizes (around 10-20) result in lower RMSE values.
+
+```{r}
+boost_spec <- boost_tree(trees = tune(), tree_depth = tune(), mtry = tune(), min_n = tune()) |>  
+  set_engine("xgboost", nthread = 16) |>  
+  set_mode("regression")
+boost_wf <- wf_custom(boost_spec)
+# boost_tuned <- grid_custom(boost_wf, grid = 30)
+autoplot(boost_tuned)
+boost_fitted <- fit_custom(boost_wf, boost_tuned)
+boost_results <- eval_test_custom(boost_fitted, "boost")
+results_combined <- bind_rows(results_combined, boost_results)
+boost_results
+```
+
+### Single Tree Model
+
+For singe tree model, I tuned three hyperparameters: `tree_depth`, `min_n` and `cost_complexity`.The first plot suggests an optimal cost_complexity around -5 to -2.5 on the log-10 scale.
+The second plot indicates an optimal min_n of 10 to 20 observations per leaf node.
+The third plot shows an optimal tree_depth of 4 to 8 levels, balancing underfitting and overfitting.
+After tuning, the single tree model achieved an RMSE of 0.74 on the test set, relatively lower than the baseline simple linear regression model, but significantly more complex.
+It can be concluded that the model is not a great choice for predicting wine quality.
+
+```{r}
+tree_spec <- decision_tree(tree_depth = tune(), min_n = tune(), cost_complexity = tune()) |>  
+  set_engine("rpart") |>  
+  set_mode("regression")
+tree_wf <- wf_custom(tree_spec)
+# tree_tuned <- grid_custom(tree_wf)
+autoplot(tree_tuned)
+tree_fitted <- fit_custom(tree_wf, tree_tuned)
+tree_results <- eval_test_custom(tree_fitted, "tree")
+results_combined <- bind_rows(results_combined, tree_results)
+tree_results
+
+```
+
+### Cubist Model
+
+The cubist model combines decision trees with linear regression models.
+Two key hyperparameters were tuned: the number of committees and the maximum number of rules.
+The first plot shows the relationship between the number of committees and the RMSE, suggesting an optimal value around 75.
+The second plot indicates that increasing the maximum number of rules beyond 200 does not significantly improve the RMSE.
+
+```{r}
+cubist_spec <- cubist_rules(committees = tune(), neighbors = 5, max_rules = tune(), engine = "Cubist") |> 
+  set_mode("regression")
+cubist_wf <- wf_custom(cubist_spec)
+# cubist_tuned <- grid_custom(cubist_wf)
+autoplot(cubist_tuned)
+cubist_fitted <- fit_custom(cubist_wf, cubist_tuned)
+cubist_results <- eval_test_custom(cubist_fitted, "cubist")
+results_combined <- bind_rows(results_combined, cubist_results)
+cubist_results
+```
+
+### Elastic Net Model
+The elastic net model is a linear regression model that incorporates lasso and ridge regularization.
+The tuned hyperparameters included the penalty factor and the mixture ratio between lasso and ridge penalties.
+After tuning, the elastic net model achieved an RMSE of 0.74 on the test set.
+The tuned elastic net model has an alpha value close to 1, meaning the end result is similar to lasso regression.
+Additionally, because the best penalty is very small, it indicates that the tuned model is effectively a simple linear regression with all predictors included.\
+
+```{r}
+enet_spec <- linear_reg(penalty = tune(), mixture = tune()) |>  
+  set_engine("glmnet") |>  
+  set_mode("regression")
+enet_wf <- wf_custom(enet_spec)
+# enet_tuned <- grid_custom(enet_wf)
+autoplot(enet_tuned)
+enet_fitted <- fit_custom(enet_wf, enet_tuned)
+enet_results <- eval_test_custom(enet_fitted, "enet")
+results_combined <- bind_rows(results_combined, enet_results)
+enet_results
+
+```
+
+### Support Vector Machine Model
+The SVM model is also a non-baseline model.
+The tuned hyperparameters included the cost parameter, the RBF kernel parameter (sigma), and the insensitivity margin.
+The plots show the relationship between these hyperparameters and the RMSE, but no clear relationship can be witnessed.
+After tuning, the SVM model achieved an RMSE of 0.70 on the test set.
+
+```{r}
+svm_spec <- svm_rbf(mode = "regression", engine = "kernlab", cost = tune(), rbf_sigma = tune(), margin = tune())
+svm_wf <- wf_custom(svm_spec)
+svm_tuned <- grid_custom(svm_wf, grid = 20)
+autoplot(svm_tuned)
+show_best(svm_tuned, metric = "rmse", n = 10)
+svm_fitted <- fit_custom(svm_wf, svm_tuned)
+svm_results <- eval_test_custom(svm_fitted, "svm")
+results_combined <- bind_rows(results_combined, svm_results)
+svm_results
+```
+
+### Neural Network with Single Hidden Layer
+
+Normally the number of hidden units should not exceed twice the length of input vector, but for this dataset an increased number of hidden units does not lead to significant overfitting, suggesting that the model benefits from the higher capacity to capture complex patterns.
+The MLP model may have limitations in capturing feature interactions and may require further hyperparameter tuning to improve its performance.
+Tuning dropout rate does not meaningfully improve the model's performance, also suggesting that the model may not be overfitting.
+
+```{r}
+mlp_spec <- mlp(mode = "regression", engine = "keras", hidden_units = 64, dropout = 0.2, epochs = 80)
+mlp_wf <- wf_custom(mlp_spec)
+```
+
+Unable to suppress the following output
+```{r, echo=FALSE, message=FALSE, warning=FALSE, max.print=1}
+mlp_fitted <- mlp_wf |> fit(data = train.white)
+```
+
+
+```{r}
+mlp_results <- eval_test_custom(mlp_fitted, "mlp")
+results_combined <- bind_rows(results_combined, mlp_results)
+```
+
+### Lasso Model
+
+For lasso regression model, I tuned the hyperparameter of penalty factor, which controls the amount of regularization.
+The plot shows the relationship between the amount of regularization and the RMSE, indicating that a moderate amount of regularization is optimal.
+After tuning, the lasso regression model achieved an RMSE of 0.74 on the test set, which is very close to the RMSE obtained by the elastic net model.
+This similarity can be attributed to the fact that the elastic net model, with its tuned hyperparameters, effectively reduced to a lasso-like solution.
+
+```{r}
+# Lasso regression model
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) |> set_engine("glmnet") |> set_mode("regression")
+lasso_wf <- wf_custom(lasso_spec)
+lasso_tuned <- grid_custom(lasso_wf, grid = 20)
+autoplot(lasso_tuned)
+show_best(lasso_tuned, metric = "rmse", n = 10)
+lasso_fitted <- fit_custom(lasso_wf, lasso_tuned)
+lasso_fitted |> pull_workflow_fit() |> tidy()
+lasso_results <- eval_test_custom(lasso_fitted, "lasso")
+results_combined <- bind_rows(results_combined, lasso_results)
+lasso_results
+```
+
+### Generalized Additive Model
+GAM is relatively interpretable and can capture non-linear relationships between predictors and the target variable.
+It is a good choice for this dataset because it has a relative small number of predictors and the relationship between predictors and the target variable is not linear.
+
+```{r}
+# .742
+names(bake.white.train)
+gam_fitted <- gam::gam(quality ~ .+ ns(residual.sugar, 2) + s(citric.acid, 2)+
+                         s(alcohol,2) + s(chlorides, 2) , data=bake.white.train)
+# .746
+gam_fitted <- gam::gam(quality ~ .+ ns(residual.sugar, 2) + s(citric.acid, 2)
+                      , data=bake.white.train)
+# .740
+gam_fitted <- gam::gam(quality ~ .+ ns(residual.sugar, 2) + s(citric.acid, 2)+
+        ns(fixed.acidity,2)+s(alcohol,2) + s(chlorides, 2) , data=bake.white.train)
+# .740
+gam_fitted <- gam::gam(quality ~ .+ ns(residual.sugar, 2) + s(citric.acid, 2)+
+    ns(fixed.acidity,2)+s(alcohol,2) + s(chlorides, 2) , data=bake.white.train)
+# 0.720
+gam_fitted <- gam::gam(quality ~ 
+                         s(volatile.acidity) +
+                         s(citric.acid) + 
+                         residual.sugar +
+                         s(chlorides) +
+                         s(total.sulfur.dioxide) +
+                         free.sulfur.dioxide +
+                         density +
+                         s(pH) +
+                         s(sulphates) +
+                         s(alcohol),
+                       data = bake.white.train)
+
+# Calculate the RMSE and MAE for training set and test set gam_fitted
+gam_train_pred <- predict(gam_fitted, bake.white.train)
+gam_test_pred <- predict(gam_fitted, bake.white.test)
+gam_train_rmse <- sqrt(mean((gam_train_pred - bake.white.train$quality)^2))
+gam_test_rmse <- sqrt(mean((gam_test_pred - bake.white.test$quality)^2))
+gam_train_mae <- mean(abs(gam_train_pred - bake.white.train$quality))
+gam_test_mae <- mean(abs(gam_test_pred - bake.white.test$quality))
+gam_results <- tibble(
+  model = "gam",
+  train_rmse = gam_train_rmse,
+  test_rmse = gam_test_rmse,
+  train_mae = gam_train_mae,
+  test_mae = gam_test_mae
+)
+gam_results
+(results_combined <- bind_rows(results_combined, gam_results))
+
+```
+
+The selection of splines and their degrees of freedom are chosen based on the plots for each predictor against quality.
+Several models are fitted with different combinations of splines and degrees of freedom.
+The best model is the one with the most non-linear terms, but the model's train-test RMSE gap is still very small.
+This is a sign of potential underfitting.
+
+```{r}
+# Delete duplicated rows by model name in results_combined
+results_combined <- results_combined[!duplicated(results_combined$model),]
+#  Store results by test_rmse
+results_combined <- results_combined[order(results_combined$test_rmse),]
+save(rf_tuned,
+     lm_fitted,
+     tree_tuned,
+     boost_tuned,
+     cubist_tuned,
+     enet_tuned,
+     svm_tuned,
+     gam_fitted,
+     results_combined,
+     file = "data.RData")
+results_combined
+```
+
+### Comment on the results table
+
+-   Baseline Models: Two Linear Regression models, one with all predictors and the other with three predictors\
+-   Non-baseline models but still relatively interpretable: GAM, Lasso, and Elastic Net. Single Tree is more interpretable than other tree models, but still less interpretable than the three models mentioned above. GAM is the best among thses on in-distribution test data. Notably, Elastic Net and its special variant lasso are all close to Linear Regression after tuning.\
+-   Models focused on predictive accuracy without interpretability: Random Forest, Boosted Trees, Cubist, SVM, and Neural Network (the least interpretable one) with one hidden layer. Random Forest performs the best among these.\
+    High Dimensional Models and our own implementation of gradient descent are included below.\
+
+## High Dimensional Models
+
+In this section, the high-dimensional dataset with 111 columns is prepared. The original dataset undergoes several transformations and mutations to create new features. The mutate() function is used to apply polynomial transformations (squared, cubic, quartic, and log) to each predictor.\
+Additionally, interaction terms are created by combining pairs of predictors using the combn() function. These interaction terms capture the joint effect of two predictors on the target variable.\
+Principal Component Analysis is used to reduce the dimensionality of the dataset. The step_pca() function is used within the recipe to perform PCA on all predictors, with a threshold of 0.95. This means that PCA selects the principal components that explain 95% of the total variance in the dataset. 51 Predictors are selected by PCA.\
+
+```{r}
+## Prepare the high dimensional dataset
+# Extend the dataset with polynomial (squared, cubic, quartic, log) transformations
+wine_data <- bake(prep.white, wine.white)
+predictors <- setdiff(names(wine_data), "quality")
+wine_data_extended <- wine_data |>
+  mutate(across(all_of(predictors), ~ .^2, .names = "{.col}_squared")) |> 
+  mutate(across(all_of(predictors), ~ .^3, .names = "{.col}_cubic")) |> 
+  mutate(across(all_of(predictors), ~ .^4, .names = "{.col}_quartic")) |> 
+  mutate(across(all_of(predictors), ~ log(. + 4), .names = "{.col}_log"))
+
+# Add interaction terms between predictors
+combinations <- combn(predictors, 2, simplify = FALSE)
+for(combo in combinations) {
+  wine_data_extended[[paste(combo, collapse = "X")]] <- wine_data[[combo[1]]] * wine_data[[combo[2]]]
+}
+wine_data_extended <- data.frame(wine_data_extended)
+
+# Split the dataset 
+split_hd <- initial_split(wine_data_extended, prop = 0.7)
+data_train <- training(split_hd)
+data_test <- testing(split_hd)
+resamples <- vfold_cv(data_train, v = 5)
+
+# Normalize predictors 
+reci_hd <- recipe(quality ~ ., data = data_train) |> step_normalize(all_predictors())
+reci_pca <- recipe(quality ~ ., data = data_train) |> step_normalize(all_predictors()) |> step_pca(all_predictors(), threshold = 0.95)
+
+# Get number of predictors selected by PCA out of 110 in total
+num_predictors <- dim(juice(reci_pca |> prep()))[2]
+
+# Use Lasso and SVM models
+lasso_spec <- linear_reg(penalty = tune(), mixture = 1) |> set_engine("glmnet")
+svm_spec <- svm_rbf(mode = "regression", engine = "kernlab", cost = tune(), rbf_sigma = tune(), margin = tune())
+
+# Create workflows for Lasso and SVM with and without PCA
+lasso_hd_wf <- workflow() |> add_model(lasso_spec) |> add_recipe(reci_hd)
+lasso_pca_wf <- workflow() |> add_model(lasso_spec) |> add_recipe(reci_pca)
+svm_hd_wf <- workflow() |> add_model(svm_spec) |> add_recipe(reci_hd)
+svm_pca_wf <- workflow() |> add_model(svm_spec) |> add_recipe(reci_pca)
+```
+
+Two models, Lasso and Support Vector Machine, are used for high-dimensional modeling.\
+
+### Tune and evaluate SVM models
+```{r}
+svm_tuned_hd <- grid_custom(svm_hd_wf, grid = 20)
+svm_tuned_pca <- grid_custom(svm_pca_wf, grid = 20)
+autoplot(svm_tuned_hd)
+autoplot(svm_tuned_pca)
+show_best(svm_tuned_hd, metric = "rmse", n = 5)
+show_best(svm_tuned_pca, metric = "rmse", n = 5)
+svm_hd_fitted <- fit_custom(svm_hd_wf, svm_tuned_hd)
+svm_pca_fitted <- fit_custom(svm_pca_wf, svm_tuned_pca)
+svm_hd_results <- eval_test_custom(svm_hd_fitted, "svm_hd")
+svm_pca_results <- eval_test_custom(svm_pca_fitted, "svm_with_pca")
+```
+
+### Tune and evaluate Lasso models
+```{r}
+lasso_tuned_hd <- grid_custom(lasso_hd_wf, grid = 20)
+lasso_tuned_pca <- grid_custom(lasso_pca_wf, grid = 20)
+autoplot(lasso_tuned_hd)
+autoplot(lasso_tuned_pca)
+show_best(lasso_tuned_hd, metric = "rmse", n = 5)
+show_best(lasso_tuned_pca, metric = "rmse", n = 5)
+lasso_hd_fitted <- fit_custom(lasso_hd_wf, lasso_tuned_hd)
+lasso_pca_fitted <- fit_custom(lasso_pca_wf, lasso_tuned_hd)
+lasso_hd_results <- eval_test_custom(lasso_hd_fitted, "lasso_hd")
+lasso_pca_results <- eval_test_custom(lasso_pca_fitted, "lasso_with_pca")
+```
+*Save the results and the best models*
+SVM without PCA is the best high dim model
+```{r}
+hd_combined <- tibble(model = character(), test_rmse = numeric(),
+                           test_mae = numeric(), train_rmse = numeric(), train_mae = numeric())
+
+hd_combined <- bind_rows(hd_combined, svm_hd_results)
+hd_combined <- bind_rows(hd_combined, svm_pca_results)
+hd_combined <- bind_rows(hd_combined, lasso_hd_results)
+hd_combined <- bind_rows(hd_combined, lasso_pca_results)
+hd_combined
+save(
+  svm_tuned_hd,
+  svm_tuned_pca,
+  lasso_tuned_hd,
+  lasso_tuned_pca,
+  hd_combined,
+  file = "high_dim_data.RData"
+)
+```
+
+### Results
+The results show that the SVM model without PCA achieves the best performance among the high-dimensional models.
+On the other hand, the Lasso model with PCA performs better than the Lasso model without PCA.
+
+Overall, the high-dimensional models achieve worse performance than the same models without polynomial transformations, interaction terms, or dimensionality reduction techniques like PCA.\
+\
+
+## Own implementation of gradient descent
+
+I used stochastic gradient descent to optimize the weights of the linear regression model.
+Code in my [Reference](https://rpubs.com/kaiusdepaula/GradientDescentInR) does not support more than two predictors, so I implemented my own version of the algorithm.
+In addition, I added extra functionalities including momentum, early stopping, minimum delta, and plotting.
+The following functions were implemented to help the optimization:\
+```{r}
+# Initializing weights
+initialize_weights <- function(x_mat, sd = 0.01){
+  return(rnorm(ncol(x_mat), sd = sd))
+}
+
+# Loss function
+loss_rmse <- function(y_true, y_hat){
+  return(sqrt(mean((y_true - y_hat)^2)))
+}
+
+# Make predictions
+predict_custom <- function(x, w){
+  return(x %*% w)
+}
+
+# Calculate the gradient of the RMSE loss function
+gradient <- function(X, y, y_hat){
+  N = length(y)
+  db = 2 / N * t(X) %*% (y_hat - y) 
+  return(db)
+}
+
+# SGD algorithm
+# Perform gradient descent optimization
+gradient_descent <- function(x_mat, y_true, x_test, y_test, weights, learning_rate, epochs, momentum = 0.9, min_delta = 1e-4, patience = 10){
+  loss <- rep(NA, epochs) # Initialise loss vector
+  rmse_test <- rep(NA, epochs) # Initialise test RMSE vector
+  velocity <- rep(0, length(weights)) # Initialise velocity vector
+  time <- Sys.time() # Start time
+  best_loss <- Inf # Initialise best loss
+  no_improvement_count <- 0 # Initialise no improvement count
+  
+  for(i in 1:epochs){
+    y_hat <- predict_custom(x_mat, weights) # Make predictions
+    current_loss <- loss_rmse(y_true, y_hat) # Calculate loss
+    loss[i] <- current_loss
+    rmse_test[i] <- loss_rmse(y_test, X_test %*% weights) # Calculate test RMSE with matrix operations
+    grads <- gradient(x_mat, y_true, y_hat)
+    
+    # Momentum update
+    velocity <- momentum * velocity + learning_rate * grads # Update velocity
+    weights <- weights - velocity # Update weights
+    if (i %% 100 == 0){
+      print(paste0("Epoch: ",i, ", Loss: ", round(current_loss, 4), ", Time used:", round(Sys.time() - time, 4)))
+      # RMSE on test
+    }    
+    # Early stopping criteria
+    if(best_loss - current_loss > min_delta){ # Minimum delta is helpful because the loss decreases extremely slowly at the end
+      best_loss <- current_loss
+      no_improvement_count <- 0
+    } else {
+      no_improvement_count <- no_improvement_count + 1
+    }
+    if(no_improvement_count >= patience){
+      print(paste0("Early stopping at epoch: ", i, ", Loss: ", round(current_loss, 4), ", Best Loss: ", round(best_loss, 4), ", Time used: ", round(Sys.time() - time, 4)))
+      break
+    }
+  }
+  return(list(weights = weights, train_rmse = loss[1:i], test_rmse = rmse_test[1:i])) # Return weights and loss
+}
+
+```
+
+My data preparation and model fitting code is as follows: I first converted my data into a matrix and initialised the weights, then ran the gradient descent algorithm.\
+```{r}
+# Data preparation
+# Add a dummy column for the intercept 
+X_train <- cbind(1, as.matrix(select(train.white, -quality)))
+y_train <- train.white$quality
+X_test <- cbind(1, as.matrix(select(test.white, -quality)))
+y_test <- test.white$quality
+
+# Initialize weights for the model
+weights <- initialize_weights(X_train)
+
+# Run gradient descent
+log1 <- gradient_descent(X_train, y_train, X_test, y_test, weights = weights, learning_rate = 4e-5, epochs = 5000, momentum = 0.5, min_delta = 1e-3, patience = 100)
+
+# Plot the RMSE over epochs
+log1_df <- tibble(epoch = 1:length(log1$train_rmse), train_rmse = log1$train_rmse, test_rmse = log1$test_rmse)
+log1_df <- gather(log1_df, key = "Type", value = "rmse", -epoch)
+ggplot(log1_df, aes(x = epoch, y = rmse, color = Type)) +
+  geom_line() +
+  labs(title = "RMSE over epochs", x = "Epoch", y = "RMSE") +
+  theme_minimal() +
+  scale_x_log10()
+```
+\
+ 
+#### Comment on SGD:
+
+I also found that the model converges slowly after the first 200 epochs, so I could have stopped the algorithm earlier to save time. Also, through manually tuning hyperparameters, I found that a learning rate of 4e-5 and a momentum of 0.5 gave the best results in terms of convergence and test RMSE. A high learning rate would cause the algorithm to diverge, whilst too low a learning rate would cause the algorithm to converge too slowly. High momentum values would also cause the algorithm to overshoot the minimum. With low or zero momentum, the algorithm converges more smoothly, but it takes longer to be close to the minimum. As the number of hyperparameters increases, manually searching for the optimal combination can become time-consuming and inefficient. In such cases, automated hyperparameter tuning techniques like grid search can be employed to systematically explore the hyperparameter space and find the best combination.
+
+Plotting the RMSE over epochs using a logarithmic scale for the x-axis (epochs) helped me visualize the convergence behavior of the algorithm.
+I observed that the model converges slowly after the first 200 epochs, indicating that I could have stopped the algorithm earlier to save time without significant loss in performance.\
+ 
+\
+## Out-Of-Distribution Generalisation
+In this section, I used the red wine dataset to test the generalization of the model trained on the white wine dataset.
+I used the same model and hyperparameters as the white wine dataset to predict the red wine dataset.\
+I can witness two types of shifts, covariate shift and concept shift.
+Covariate shift is when the input distribution changes, while concept shift is when the output distribution changes.\
+I first checked for covariate shift by checking the quantile values of the predictors in the red wine dataset and comparing them with the quantile values of the predictors in the white wine dataset.
+I then checked for concept shift by comparing the test performances of the red wine dataset with the test performances of the white wine dataset.\
+\
+ 
+### Covariate Shift
+```{r}
+summary(wine.red)
+summary(wine.white)
+
+# Check if red wine dataset has the same predictors as the white wine dataset
+dim(bake.red)
+# Predict on a new dataset
+model_name <- "lm"
+preds_red <- predict(lm_fitted, new_data = wine.red)
+test_preds <- preds_red |>
+  bind_cols(actual = wine.red$quality)
+rmse_val <- rmse(test_preds, truth = actual, estimate = .pred) |> pull(.estimate)
+mae_val <- mae(test_preds, truth = actual, estimate = .pred) |> pull(.estimate)
+tibble(
+  model = model_name,
+  test_rmse = rmse_val,
+  test_mae = mae_val
+  )
+```
+
+Based on the summary statistics provided for the red wine and white wine datasets, I can observe **covariate shift** for certain predictors. Notably, the "residual.sugar" predictor exhibits a significant shift, with the median value being 5.2 in the white wine dataset, compared to only 2.2 in the red wine dataset. The range of values also differs considerably, with the maximum value in the white wine dataset (65.8) being much higher than in the red wine dataset (15.5). Additionally, the "free.sulfur.dioxide" predictor shows a shift in distribution, with the white wine dataset having higher values overall. The median value in the white wine dataset is 34, while in the red wine dataset, it is only 14. The "total.sulfur.dioxide" predictor also demonstrates covariate shift, with the white wine dataset having generally higher values compared to the red wine dataset.
+
+On the contrary, the pH values have similar distributions in both datasets. The median pH value is 3.18 in the white wine dataset and 3.31 in the red wine dataset. The range of pH values is also comparable, with the minimum and maximum values being close in both datasets. The distribution of sulphates is also relatively similar in both datasets. The median value is 0.47 in the white wine dataset and 0.62 in the red wine dataset. The range of values is also comparable.\
+
+These differences in the distributions of input variables between the white wine and red wine datasets indicate the presence of covariate shift for the mentioned predictors, but the shift is not to the same degree for all predictors. 
+ 
+### Concept Shift
+
+I then moved to check for concept shift by comparing the test performances of the red wine dataset with the test performances of the white wine dataset. I will also use the same model and hyperparameters as the white wine dataset to predict the red wine dataset.
+
+```{r}
+# Function of evaluating each model by OOD
+eval_ood <- function(model, model_name) {
+  ood_preds <- predict(model, new_data = wine.red) |>
+    bind_cols(actual = wine.red$quality)
+  
+  rmse_ood <- rmse(ood_preds, truth = actual, estimate = .pred) |> pull(.estimate)
+  mae_ood <- mae(ood_preds, truth = actual, estimate = .pred) |> pull(.estimate)
+  
+  tibble(
+    model = model_name,
+    ood_rmse = rmse_ood, 
+    ood_mae = mae_ood
+  )
+}
+# lm_baseline model
+lm_baseline.ood <- eval_ood(lm_baseline_fitted, "lm_baseline")
+# lm model
+lm.ood <- eval_ood(lm_fitted, "lm")
+# Random forest model 
+rf.ood <- eval_ood(rf_fitted, "rf")
+# Boosted trees model
+boost.ood <- eval_ood(boost_fitted, "boost")
+# Single tree model
+tree.ood <- eval_ood(tree_fitted, "tree") 
+# Cubist model
+cubist.ood <- eval_ood(cubist_fitted, "cubist")
+# Elastic net model 
+enet.ood <- eval_ood(enet_fitted, "enet")
+# SVM Model
+svm.ood <- eval_ood(svm_fitted, "svm")
+# Lasso model
+lasso.ood <- eval_ood(lasso_fitted, "lasso")
+# MLP model
+mlp.ood <- eval_ood(mlp_fitted, "mlp")
+# SVM model
+svm.ood <- eval_ood(svm_fitted, "svm")
+
+# Combined all of the results
+ood_results <- bind_rows(lm_baseline.ood, lm.ood, rf.ood, boost.ood, tree.ood, cubist.ood, 
+                         enet.ood, svm.ood, lasso.ood, mlp.ood, svm.ood)
+
+ood_and_in_distribution_combined <- left_join(results_combined, ood_results, by = "model")
+
+ood_and_in_distribution_combined <- ood_and_in_distribution_combined %>% mutate(ood_rmse/test_rmse)
+ood_tibble <- ood_and_in_distribution_combined[!duplicated(ood_and_in_distribution_combined$model), ]
+(ood_tibble <- ood_tibble[order(ood_tibble$ood_rmse),] |> mutate(across(where(is.numeric), ~ round(., 3))))
+```
+
+**Concept shift** plays a significant role from the output table. The evaluation results reveal that more complex models tend to exhibit worse generalisation when applied to the red wine dataset. This is particularly noticeable for tree models. For instance, the "rf" (random forest) model, which performed well for in-distribution data for its ability to capture complex interactions and non-linear relationships, demonstrates a substantial decline in performance. Its test RMSE on the white wine dataset is 0.61, but the OOD RMSE on the red wine dataset soars to 1.02, resulting in a ratio of 1.67. Similarly, the "cubist" model, another complex model, exhibits a test RMSE of 0.66 on the white wine dataset, but its OOD RMSE on the red wine dataset rises to 1.39, with a striking ratio of 2.12.
+
+In contrast, the "lm_baseline" model, which consists of only three predictors, shows a remarkable improvement in performance when applied to the red wine dataset. Its test RMSE on the white wine dataset is 0.78, while the OOD RMSE on the red wine dataset is 0.74, resulting in a ratio of 0.94. This indicates that the simpler linear model is able to capture the fundamental relationships between the input features and the quality score more effectively, even in the presence of concept shift. The superior generalisation of the "lm_baseline" model suggests that the key predictors included in this model have a more consistent and stable relationship with the quality score across both the white wine and red wine datasets. The model's simplicity and focus on the most informative features enable it to adapt better to the changes in the underlying CEF.
+
+It is worth noting that the presence of covariate shift, where the distribution of input features differs between the two datasets, can also contribute to the performance degradation of the more complex models. These models may have overfit to the specific characteristics of the white wine dataset, making it challenging for them to generalize well to the red wine dataset.
+
+Surprisingly, the multiple layer perceptron model, which is a complex neural network model with one hidden layer, demonstrates a relatively stable performance across the two datasets. Its test RMSE on the white wine dataset is 0.737, and its OOD RMSE on the red wine dataset is 0.96, resulting in a ratio of 1.3. This suggests that the MLP model is able to adapt to the concept shift to some extent, possibly due to its ability to capture complex patterns and relationships in the data trough hidden units.
